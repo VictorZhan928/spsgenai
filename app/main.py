@@ -216,3 +216,125 @@ def generate_gan(req: GANRequest):
     transforms.ToPILImage()(grid).save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return {"image_base64": b64}
+
+# --- EBM + Diffusion inference endpoints ---
+import io, base64
+from fastapi import HTTPException
+from pydantic import BaseModel
+import torch
+from torchvision import utils as vutils, transforms
+
+from app.ebm_model import EnergyCNN
+from app.diffusion_model import TinyUNet
+
+# Reuse the global device if already defined; otherwise define it.
+try:
+    _device
+except NameError:
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =========================
+# EBM: load + generation
+# =========================
+_ebm = EnergyCNN().to(_device)
+try:
+    _ebm.load_state_dict(torch.load("artifacts/ebm_cifar10.pt", map_location=_device)["state_dict"])
+    _ebm.eval()
+    _ebm_ready = True
+    print("✅ EBM weights loaded")
+except Exception as e:
+    _ebm_ready = False
+    print("⚠️ EBM not loaded:", e)
+
+def _ebm_langevin(x, steps=60, step_size=1e-2, noise=0.01):
+    """
+    Langevin sampling that DESCENDS energy wrt the INPUT (not params).
+    """
+    x = x.clone().detach().requires_grad_(True)
+    for _ in range(steps):
+        e = _ebm(x).sum()
+        grad, = torch.autograd.grad(e, x, create_graph=False)
+        x = (x - step_size * grad + noise * torch.randn_like(x)).clamp(-1, 1).detach().requires_grad_(True)
+    return x.detach()
+
+class EBMRequest(BaseModel):
+    n: int = 16  # must be a perfect square
+
+@app.post("/generate_ebm")
+def generate_ebm(req: EBMRequest):
+    if not _ebm_ready:
+        raise HTTPException(status_code=503, detail="Train EBM first (artifacts/ebm_cifar10.pt).")
+    n = int(req.n)
+    side = int(n ** 0.5)
+    if side * side != n:
+        raise HTTPException(status_code=400, detail="n must be a perfect square (e.g., 16, 25, 36).")
+
+    with torch.no_grad():
+        x0 = torch.randn(n, 3, 32, 32, device=_device).clamp(-1, 1)
+    xk = _ebm_langevin(x0, steps=60, step_size=1e-2, noise=0.01)
+
+    grid = vutils.make_grid(xk.cpu(), nrow=side, normalize=True, value_range=(-1, 1))
+    buf = io.BytesIO()
+    transforms.ToPILImage()(grid).save(buf, format="PNG")
+    return {"image_base64": base64.b64encode(buf.getvalue()).decode("utf-8")}
+
+# =========================
+# Diffusion: load + sampling
+# =========================
+# Must match your training T (your trainer default was 200)
+_diff_T = 200
+_diff_model = TinyUNet().to(_device)
+
+try:
+    ck = torch.load("artifacts/diffusion_cifar10.pt", map_location=_device)
+    _diff_model.load_state_dict(ck["state_dict"])
+    _diff_model.eval()
+    _diff_ready = True
+    print("✅ Diffusion weights loaded")
+except Exception as e:
+    _diff_ready = False
+    print("⚠️ Diffusion not loaded:", e)
+
+# Precompute the same schedule used in training
+_diff_betas       = torch.linspace(1e-4, 0.02, _diff_T, device=_device)
+_diff_alphas      = 1.0 - _diff_betas
+_diff_alpha_hat   = torch.cumprod(_diff_alphas, dim=0)
+
+class DiffusionRequest(BaseModel):
+    n: int = 16  # must be a perfect square
+
+@app.post("/generate_diffusion")
+def generate_diffusion(req: DiffusionRequest):
+    if not _diff_ready:
+        raise HTTPException(status_code=503, detail="Train Diffusion first (artifacts/diffusion_cifar10.pt).")
+
+    n = int(req.n)
+    side = int(n ** 0.5)
+    if side * side != n:
+        raise HTTPException(status_code=400, detail="n must be a perfect square (e.g., 16, 25, 36).")
+
+    with torch.no_grad():
+        # Reverse diffusion from pure noise
+        x = torch.randn(n, 3, 32, 32, device=_device)
+        for t in reversed(range(_diff_T)):
+            t_batch = torch.full((n,), t, dtype=torch.long, device=_device)
+            eps_theta = _diff_model(x, t_batch)          # predict noise at timestep t
+            beta_t = _diff_betas[t]
+            alpha_t = _diff_alphas[t]
+            alpha_hat_t = _diff_alpha_hat[t]
+
+            # DDPM mean update: x_{t-1} = 1/sqrt(alpha_t) * ( x_t - ((1-alpha_t)/sqrt(1-alpha_hat_t)) * eps_theta )
+            coef1 = 1.0 / torch.sqrt(alpha_t)
+            coef2 = (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_hat_t + 1e-8)
+            x = coef1 * (x - coef2 * eps_theta)
+
+            # Add noise except at t=0
+            if t > 0:
+                x += torch.sqrt(beta_t) * torch.randn_like(x)
+
+        grid = vutils.make_grid(x.clamp(-1, 1).cpu(), nrow=side, normalize=True, value_range=(-1, 1))
+
+    buf = io.BytesIO()
+    transforms.ToPILImage()(grid).save(buf, format="PNG")
+    return {"image_base64": base64.b64encode(buf.getvalue()).decode("utf-8")}
+
