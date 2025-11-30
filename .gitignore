@@ -47,4 +47,6 @@ artifacts/
 *.zip
 .venv/
 __pycache__/
+artifacts/gpt2_squad_custom/
+
 

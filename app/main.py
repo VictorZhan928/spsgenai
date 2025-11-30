@@ -11,6 +11,8 @@ from app.cnn_model import SimpleCNN
 import base64, io
 from torchvision import transforms, utils as vutils
 from app.gan_model import Generator
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
 
 import numpy as np
 
@@ -337,4 +339,80 @@ def generate_diffusion(req: DiffusionRequest):
     buf = io.BytesIO()
     transforms.ToPILImage()(grid).save(buf, format="PNG")
     return {"image_base64": base64.b64encode(buf.getvalue()).decode("utf-8")}
+
+# ---------- Fine-tuned GPT-2 QA (Module 11) ----------
+
+# Path where finetune_gpt2_squad.py saved the model
+_LLM_DIR = "artifacts/gpt2_squad_custom"
+
+_llm_device = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "cpu"
+)
+
+try:
+    _llm_tokenizer = AutoTokenizer.from_pretrained(_LLM_DIR)
+    _llm_model = AutoModelForCausalLM.from_pretrained(_LLM_DIR).to(_llm_device)
+    _llm_model.eval()
+    _llm_ready = True
+    print("✅ GPT-2 fine-tuned model loaded")
+except Exception as e:
+    print("⚠️ GPT-2 model NOT loaded:", e)
+    _llm_ready = False
+
+
+class QARequest(BaseModel):
+    question: str
+    context: str
+
+
+class QAResponse(BaseModel):
+    answer: str
+
+
+@app.post("/qa_llm", response_model=QAResponse)
+def qa_llm(req: QARequest):
+    """
+    Answer a question given a context using the fine-tuned GPT-2 model.
+    We enforce the requested format:
+    - Start with: 'That is a great question.'
+    - End with: 'Let me know if you have any other questions.'
+    """
+    if not _llm_ready:
+        raise HTTPException(
+            status_code=503,
+            detail="Fine-tuned GPT-2 model not loaded. Train it and ensure artifacts/gpt2_squad_custom exists."
+        )
+
+    # Prompt template (you used similar style during fine-tuning)
+    prefix = "That is a great question. "
+    suffix = " Let me know if you have any other questions."
+
+    prompt = (
+        f"Question: {req.question}\n"
+        f"Context: {req.context}\n"
+        f"Answer: {prefix}"
+    )
+
+    inputs = _llm_tokenizer(prompt, return_tensors="pt").to(_llm_device)
+
+    with torch.no_grad():
+        outputs = _llm_model.generate(
+            **inputs,
+            max_new_tokens=80,
+            do_sample=True,
+            top_p=0.95,
+            temperature=0.7,
+            pad_token_id=_llm_tokenizer.eos_token_id,
+        )
+
+    full_text = _llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # Strip the prompt part; keep only what model added
+    generated = full_text[len(prompt):].strip()
+
+    # Enforce the required format explicitly
+    answer = prefix + generated + suffix
+
+    return QAResponse(answer=answer)
 
